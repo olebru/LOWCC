@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""lowcc — list files with high cyclomatic complexity.
+"""lowcc — list functions with high cyclomatic complexity.
 
 Thin wrapper around `lizard` (https://github.com/terryyin/lizard). Lizard does
-the parsing and per-function CC calculation; this script aggregates results
-per file and emits a markdown report of files at or above a threshold.
+the parsing and per-function CC calculation; this script filters and emits a
+markdown report of functions at or above a configurable CC threshold.
 
 Requires `lizard` to be installed and available on PATH.
 """
@@ -84,13 +84,15 @@ DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
 
 
 @dataclass
-class FileResult:
-    path: str
+class FunctionResult:
+    file: str
     language: str
-    complexity: int      # sum of function CCs in the file
-    functions: int
-    max_func_cc: int
-    nloc: int            # sum of function NLOC
+    name: str
+    complexity: int
+    nloc: int
+    params: int
+    length: int
+    start_line: int
 
 
 def require_lizard() -> str:
@@ -124,72 +126,72 @@ def run_lizard(lizard: str, target: Path, excludes: list[str]) -> str:
     return proc.stdout
 
 
-def parse_csv(csv_text: str) -> list[FileResult]:
-    """Aggregate lizard's per-function CSV rows into per-file results.
+def parse_csv(csv_text: str) -> list[FunctionResult]:
+    """Parse lizard's per-function CSV rows.
 
     Lizard CSV columns: NLOC, CCN, token, PARAM, length, location, file,
     function, long_name, start_line, end_line.
     """
-    aggregates: dict[str, dict[str, int]] = {}
+    results: list[FunctionResult] = []
     reader = csv.reader(io.StringIO(csv_text))
     for row in reader:
-        if len(row) < 7:
+        if len(row) < 10:
             continue
         try:
             nloc = int(row[0])
             ccn = int(row[1])
+            params = int(row[3])
+            length = int(row[4])
+            start_line = int(row[9])
         except ValueError:
             continue
         fpath = row[6]
-        bucket = aggregates.setdefault(fpath, {"nloc": 0, "cc": 0, "fns": 0, "max": 0})
-        bucket["nloc"] += nloc
-        bucket["cc"] += ccn
-        bucket["fns"] += 1
-        if ccn > bucket["max"]:
-            bucket["max"] = ccn
-
-    results: list[FileResult] = []
-    for fpath, data in aggregates.items():
+        name = row[7]
         ext = os.path.splitext(fpath)[1].lower()
-        results.append(FileResult(
-            path=fpath,
+        results.append(FunctionResult(
+            file=fpath,
             language=EXT_TO_LANG.get(ext, ext.lstrip(".").upper() or "unknown"),
-            complexity=data["cc"],
-            functions=data["fns"],
-            max_func_cc=data["max"],
-            nloc=data["nloc"],
+            name=name,
+            complexity=ccn,
+            nloc=nloc,
+            params=params,
+            length=length,
+            start_line=start_line,
         ))
     return results
 
 
 def render_report(
-    results: list[FileResult],
+    results: list[FunctionResult],
     threshold: int,
     root: Path,
     show_all: bool,
 ) -> str:
     filtered = results if show_all else [r for r in results if r.complexity >= threshold]
-    filtered.sort(key=lambda r: (-r.complexity, r.path))
+    filtered.sort(key=lambda r: (-r.complexity, r.file, r.start_line))
 
-    by_lang: dict[str, list[FileResult]] = {}
+    by_lang: dict[str, list[FunctionResult]] = {}
     for r in results:
         by_lang.setdefault(r.language, []).append(r)
+
+    files_scanned = len({r.file for r in results})
 
     lines: list[str] = []
     lines.append("# Cyclomatic Complexity Report")
     lines.append("")
     lines.append(f"- **Root:** `{root}`")
     lines.append(f"- **Engine:** lizard")
-    lines.append(f"- **Files analyzed:** {len(results)}")
+    lines.append(f"- **Files analyzed:** {files_scanned}")
+    lines.append(f"- **Functions analyzed:** {len(results)}")
     lines.append(f"- **Threshold:** {threshold}")
-    lines.append(f"- **Files at or above threshold:** "
+    lines.append(f"- **Functions at or above threshold:** "
                  f"{sum(1 for r in results if r.complexity >= threshold)}")
     lines.append("")
 
     if by_lang:
         lines.append("## Languages analyzed")
         lines.append("")
-        lines.append("| Language | Files | Max File CC | Avg File CC |")
+        lines.append("| Language | Functions | Max CC | Avg CC |")
         lines.append("|---|---:|---:|---:|")
         for name in sorted(by_lang):
             bucket = by_lang[name]
@@ -198,7 +200,7 @@ def render_report(
             lines.append(f"| {name} | {len(bucket)} | {max_cc} | {avg_cc:.1f} |")
         lines.append("")
 
-    heading = "All files" if show_all else f"Files with CC ≥ {threshold}"
+    heading = "All functions" if show_all else f"Functions with CC ≥ {threshold}"
     lines.append(f"## {heading}")
     lines.append("")
     if not filtered:
@@ -206,16 +208,16 @@ def render_report(
         lines.append("")
         return "\n".join(lines)
 
-    lines.append("| # | File | Language | File CC | Funcs | Max Func CC | NLOC |")
-    lines.append("|---:|---|---|---:|---:|---:|---:|")
+    lines.append("| # | Function | File:Line | Language | CC | NLOC | Params | Length |")
+    lines.append("|---:|---|---|---|---:|---:|---:|---:|")
     for idx, r in enumerate(filtered, start=1):
         try:
-            rel = os.path.relpath(r.path, root)
+            rel = os.path.relpath(r.file, root)
         except ValueError:
-            rel = r.path
+            rel = r.file
         lines.append(
-            f"| {idx} | `{rel}` | {r.language} | {r.complexity} | "
-            f"{r.functions} | {r.max_func_cc} | {r.nloc} |"
+            f"| {idx} | `{r.name}` | `{rel}:{r.start_line}` | {r.language} | "
+            f"{r.complexity} | {r.nloc} | {r.params} | {r.length} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -224,13 +226,12 @@ def render_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="lowcc",
-        description="Report files with high cyclomatic complexity (powered by lizard).",
+        description="Report functions with high cyclomatic complexity (powered by lizard).",
     )
     parser.add_argument("path", type=Path, help="Repository or folder to scan.")
     parser.add_argument(
         "-t", "--threshold", type=int, default=10,
-        help="Minimum file CC for a file to appear in the report (default: 10). "
-             "File CC = sum of CCs of all functions in the file.",
+        help="Minimum function CC for a function to appear in the report (default: 10).",
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=Path("lowcc-report.md"),
@@ -238,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--all", action="store_true",
-        help="Include every analyzed file in the table, not just those over the threshold.",
+        help="Include every analyzed function in the table, not just those over the threshold.",
     )
     parser.add_argument(
         "-x", "--exclude", action="append", default=[], metavar="GLOB",
@@ -272,7 +273,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         args.output.write_text(report, encoding="utf-8")
         flagged = sum(1 for r in results if r.complexity >= args.threshold)
-        print(f"Analyzed {len(results)} files; {flagged} at or above CC {args.threshold}.")
+        files_scanned = len({r.file for r in results})
+        print(f"Analyzed {len(results)} functions across {files_scanned} files; "
+              f"{flagged} at or above CC {args.threshold}.")
         print(f"Report written to {args.output}")
     return 0
 
